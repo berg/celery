@@ -5,7 +5,7 @@ import warnings
 
 from datetime import timedelta
 
-from carrot.messaging import Consumer, Publisher
+from carrot.messaging import Consumer, ConsumerSet, Publisher
 
 from celery import conf
 from celery import states
@@ -29,7 +29,7 @@ class ResultPublisher(Publisher):
 
     def __init__(self, connection, task_id, **kwargs):
         super(ResultPublisher, self).__init__(connection,
-                        routing_key=task_id.replace("-", ""),
+                        routing_key=task_id,
                         **kwargs)
 
 
@@ -41,9 +41,8 @@ class ResultConsumer(Consumer):
     auto_delete = True
 
     def __init__(self, connection, task_id, **kwargs):
-        routing_key = task_id.replace("-", "")
         super(ResultConsumer, self).__init__(connection,
-                queue=routing_key, routing_key=routing_key, **kwargs)
+                queue=task_id, routing_key=task_id, **kwargs)
 
 
 class AMQPBackend(BaseDictBackend):
@@ -91,15 +90,13 @@ class AMQPBackend(BaseDictBackend):
                                exchange=self.exchange,
                                exchange_type=self.exchange_type,
                                delivery_mode=delivery_mode,
-                               serializer=self.serializer,
-                               auto_delete=self.auto_delete)
+                               serializer=self.serializer)
 
     def _create_consumer(self, task_id, connection):
         return ResultConsumer(connection, task_id,
                               exchange=self.exchange,
                               exchange_type=self.exchange_type,
                               durable=self.persistent,
-                              auto_delete=self.auto_delete,
                               queue_arguments=self.queue_arguments)
 
     def store_result(self, task_id, result, status, traceback=None,
@@ -166,33 +163,55 @@ class AMQPBackend(BaseDictBackend):
         finally:
             consumer.close()
 
-    def consume(self, task_id, timeout=None):
-        results = []
+    def drain_events(self, consumer, timeout=None):
+        wait = self.connection.drain_events
+        results = {}
 
         def callback(meta, message):
             if meta["status"] in states.READY_STATES:
-                results.append(meta)
+                results[message.delivery_info["routing_key"]] = meta
 
-        wait = self.connection.drain_events
-        consumer = self._create_consumer(task_id, self.connection)
         consumer.register_callback(callback)
 
+        time_start = time.time()
+        while True:
+            # Total time spent may exceed a single call to wait()
+            if timeout and time.time() - time_start >= timeout:
+                raise socket.timeout()
+            wait(timeout=timeout)
+            if results:
+                # Got event on the wanted channel.
+                break
+
+        for task_id, meta in results.items():
+            self._cache[task_id] = meta
+
+        return results
+
+    def consume(self, task_id, timeout=None):
+        consumer = self._create_consumer(task_id, self.connection)
         consumer.consume()
         try:
-            time_start = time.time()
-            while True:
-                # Total time spent may exceed a single call to wait()
-                if timeout and time.time() - time_start >= timeout:
-                    raise socket.timeout()
-                wait(timeout=timeout)
-                if results:
-                    # Got event on the wanted channel.
-                    break
+            return self.drain_events(consumer, timeout=timeout).values()[0]
         finally:
             consumer.close()
 
-        self._cache[task_id] = results[0]
-        return results[0]
+    def get_many(self, task_ids, timeout=None):
+        consumers = [self._create_consumer(task_id, self.connection)
+                            for task_id in task_ids]
+        cset = ConsumerSet(self.connection, consumers=consumers)
+        cset.consume()
+        ids = set(task_ids)
+        results = {}
+        try:
+            while ids:
+                r = self.drain_events(cset, timeout=timeout)
+                ids = ids ^ set(r.keys())
+                results.update(r)
+        finally:
+            cset.close()
+
+        return results
 
     def close(self):
         if self._connection is not None:
